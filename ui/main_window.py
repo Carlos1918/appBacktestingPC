@@ -384,6 +384,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.live_timer.stop()
+        # Si hay un hilo de carga en curso (MT5, CSV o sondeo en vivo) y la
+        # ventana se cierra sin esperarlo, Qt destruye el QThread mientras el
+        # hilo real sigue vivo ("QThread: Destroyed while thread is still
+        # running") — puede colgar el cierre o crashear. Se le da un margen
+        # corto para terminar solo; si no llega a tiempo, se pide que se
+        # interrumpa antes de seguir con el cierre.
+        for attr in ("_fetch_worker", "_csv_worker", "_live_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(3000)
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
         mt5_data.disconnect()
@@ -878,12 +889,29 @@ class MainWindow(QMainWindow):
         if not self.chart.base_candles:
             return
         self.pause()
-        self.chart.reveal_index = max(self.chart.view_count, val)
+        new_index = max(self.chart.view_count, val)
+        if self.chart.open_trade and new_index > self.chart.reveal_index:
+            # A diferencia de step()/on_finish_replay(), esto puede saltar varias
+            # velas de golpe — si hay una operación abierta, hay que recorrerlas
+            # una por una comprobando el SL/TP, si no el cierre real se pierde
+            # (el trade queda "abierto" en el journal aunque el precio ya lo haya
+            # tocado en alguna de las velas saltadas).
+            end = min(new_index, len(self.chart.base_candles))
+            for idx in range(self.chart.reveal_index, end):
+                candle = self.chart.base_candles[idx]
+                self.chart.reveal_index = idx + 1
+                if self.chart.open_trade:
+                    self.chart._check_trade_close(candle)
+                if not self.chart.open_trade:
+                    break
+        else:
+            self.chart.reveal_index = new_index
         if self.chart.is_bounded():
             self._disable_live_mode()
         self.chart.update()
         self.update_scrub_label()
         self.update_last_close()
+        self.refresh_open_banner()
 
     def update_scrub_label(self):
         total = len(self.chart.base_candles)
@@ -1080,7 +1108,11 @@ class MainWindow(QMainWindow):
             "price_digits": ch.price_digits,
             "lot_value": self.lot_spin.value(),
             "balance_spin_value": self.balance_spin.value(),
-            "total_trades": len(self.trades),
+            # Trades de ESTE símbolo, no el total global del journal — es lo que
+            # se muestra junto al nombre de la sesión en "Cargar sesión...", y
+            # mostrar ahí el conteo global era engañoso (todas las sesiones
+            # guardadas mostraban el mismo número sin importar el símbolo).
+            "total_trades": sum(1 for t in self.trades if t.get("symbol") == self.symbol_field.text().strip()),
         }
 
     def _restore_session_ui_state(self, state):

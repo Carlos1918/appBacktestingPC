@@ -1129,10 +1129,19 @@ class ChartWidget(QWidget):
 
     # ── ICT detection cache ──
     def _get_ict_cache(self):
+        """`display_candles()` devuelve un slice nuevo en cada llamada, así que no
+        se puede usar `id(candles)` como parte de la clave de caché (el id() de un
+        slice recién creado nunca coincide con el de la llamada anterior, aunque el
+        contenido sea idéntico). Antes esto hacía que `detect_all()` — que incluye
+        un escaneo de FVG sobre todo el histórico revelado — se recalculara en
+        cada repintado (cada movimiento del mouse), no solo cuando cambiaban los
+        datos. La clave ahora es (cantidad de velas, hora y close de la última) —
+        el mismo patrón que ya usa `_get_ema` — así que solo se recalcula cuando de
+        verdad hay una vela nueva o cambió el precio de la última (tick en vivo)."""
         candles = self.display_candles()
         if not candles:
             return {}
-        key = id(candles), len(candles), candles[-1]["t"] if candles else ""
+        key = (len(candles), candles[-1]["t"], candles[-1]["c"])
         if self._ict_cache.get("_key") == key:
             return self._ict_cache
         try:

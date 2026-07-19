@@ -47,7 +47,12 @@ def detect_fvgs(candles, max_lookback=None):
       - Bullish FVG: c1.high < c3.low  (gap alcista entre c1 y c3)
       - Bearish FVG: c1.low  > c3.high (gap bajista entre c1 y c3)
       - El gap debe superar MIN_GAP_FRAC * precio_medio
-      - La vela 2 debe tener cuerpo en la direccion del gap (rechazo)
+      - La vela 2 es la vela de impulso/desplazamiento que abre el hueco: debe
+        tener cuerpo en la MISMA direccion del gap (alcista para FVG alcista,
+        bajista para FVG bajista) -- no una vela de rechazo en contra. Un FVG
+        alcista real es, por definicion, producto de un movimiento fuerte hacia
+        arriba (vela 2 alcista); exigir lo contrario descartaba los FVG reales
+        y solo dejaba pasar configuraciones que no son FVG de verdad.
     """
     n = len(candles)
     results = []
@@ -57,9 +62,9 @@ def detect_fvgs(candles, max_lookback=None):
         avg_price = (c1["h"] + c1["l"] + c3["h"] + c3["l"]) / 4
         min_gap = avg_price * MIN_GAP_FRAC
 
-        # Bullish FVG: gap al alza, c2 bajista (rechazo)
+        # Bullish FVG: gap al alza, c2 alcista (vela de impulso)
         gap = c3["l"] - c1["h"]
-        if gap > min_gap and c2["c"] < c2["o"]:
+        if gap > min_gap and c2["c"] > c2["o"]:
             results.append({
                 "type": "bullish",
                 "idx": i - 1,
@@ -70,9 +75,9 @@ def detect_fvgs(candles, max_lookback=None):
             })
             continue
 
-        # Bearish FVG: gap a la baja, c2 alcista (rechazo)
+        # Bearish FVG: gap a la baja, c2 bajista (vela de impulso)
         gap = c1["l"] - c3["h"]
-        if gap > min_gap and c2["c"] > c2["o"]:
+        if gap > min_gap and c2["c"] < c2["o"]:
             results.append({
                 "type": "bearish",
                 "idx": i - 1,
@@ -330,16 +335,33 @@ def calc_pd_array(high, low):
 
 # ── OTE (Optimal Trade Entry) ──
 def calc_ote(high, low, kind="bullish"):
-    """Zona OTE ICT: Fibonacci 0.618 - 0.79 de un movimiento.
+    """Zona OTE ICT: Fibonacci 0.618 - 0.79 de un movimiento, medido HACIA ATRAS
+    desde el extremo mas reciente del tramo (asi es como se lee el retroceso:
+    62%/79% es cuanto retrocedio el precio desde ese extremo, no cuanto avanzo
+    desde el origen del tramo).
 
-    Para entradas alcistas se usa el retroceso de un movimiento bajista,
-    y viceversa.
+    - Bullish (tramo alcista low->high, se espera un retroceso para comprar):
+      se mide hacia atras desde el high. Cae por debajo del equilibrio (zona de
+      descuento) -- que es justamente donde ICT ensenia a comprar.
+    - Bearish (tramo bajista high->low, se espera un retroceso para vender):
+      se mide hacia atras desde el low. Cae por encima del equilibrio (zona de
+      premium) -- donde ICT ensenia a vender.
+
+    Antes esta funcion ignoraba `kind` por completo y siempre devolvia
+    low + rango*0.618..0.79, que cae en la mitad PREMIUM del rango (por encima
+    del equilibrio) -- es decir, marcaba la zona de compra justo en el lado
+    equivocado del rango.
     """
     if high == low:
         return None
-    fib618 = low + (high - low) * 0.618
-    fib79  = low + (high - low) * 0.79
-    return {"high": max(fib618, fib79), "low": min(fib618, fib79)}
+    rng = high - low
+    if kind == "bullish":
+        f618 = high - rng * 0.618
+        f79  = high - rng * 0.79
+    else:
+        f618 = low + rng * 0.618
+        f79  = low + rng * 0.79
+    return {"high": max(f618, f79), "low": min(f618, f79)}
 
 
 # ── Detector completo ──
@@ -356,10 +378,16 @@ def detect_all(candles):
     obs     = detect_order_blocks(candles)
     choch   = detect_choch(candles, swing_highs, swing_lows)
     liq     = detect_liquidity(swing_highs, swing_lows)
-    last_60 = candles[-60:] if len(candles) >= 60 else candles
-    pd      = calc_pd_array(max(c["h"] for c in last_60), min(c["l"] for c in last_60))
 
-    # OTE basado en el rango de los ultimos 2 swing points
+    # Rango de negociacion (dealing range) para Premium/Discount y OTE: el
+    # tramo entre el swing high y el swing low mas recientes -- no un lookback
+    # arbitrario de N velas, que puede cortar un tramo a la mitad o mezclar
+    # varios tramos sin relacion entre si. El swing point mas reciente
+    # (cronologicamente) marca el sesgo: si el ultimo es un low, el tramo mas
+    # reciente fue bajista y ahora se espera un retroceso alcista (OTE de
+    # compra); si el ultimo es un high, fue alcista y se espera un retroceso
+    # bajista (OTE de venta).
+    pd = None
     ote = None
     if swing_highs and swing_lows:
         last_sh = swing_highs[-1]
@@ -367,7 +395,12 @@ def detect_all(candles):
         move_high = max(last_sh["price"], last_sl["price"])
         move_low  = min(last_sh["price"], last_sl["price"])
         if move_high != move_low:
-            ote = calc_ote(move_high, move_low, "bullish")
+            pd = calc_pd_array(move_high, move_low)
+            kind = "bullish" if last_sl["idx"] > last_sh["idx"] else "bearish"
+            ote = calc_ote(move_high, move_low, kind)
+    if pd is None:
+        last_60 = candles[-60:] if len(candles) >= 60 else candles
+        pd = calc_pd_array(max(c["h"] for c in last_60), min(c["l"] for c in last_60))
 
     return {
         "fvgs":         fvgs,
