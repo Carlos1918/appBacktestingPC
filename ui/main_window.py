@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, QTimer, QSettings, Signal
 from PySide6.QtGui import QColor, QAction
 
 from chart.chart_widget import ChartWidget
-from core import journal_store, session_store, pdf_export
+from core import journal_store, session_store, pdf_export, stats as journal_stats
 from core import mt5_data
 from core.mt5_workers import FetchWorker, LiveTickWorker, CsvLoadWorker
 from core.trading_account import TradingAccount
@@ -296,6 +296,14 @@ class MainWindow(QMainWindow):
             val = QLabel("0"); val.setStyleSheet("font-size:18px; font-weight:600; color:#d1d4dc;")
             self.stats_grid.addWidget(lab, 0, i)
             self.stats_grid.addWidget(val, 1, i)
+            self.stat_labels[key] = val
+        # Segunda fila: estadísticas avanzadas (profit factor, Sharpe por-trade,
+        # rachas consecutivas, mejor/peor R) — ver core/stats.py.
+        for i, key in enumerate(["Profit Factor", "Sharpe", "Racha Ganadora", "Racha Perdedora", "Mejor R", "Peor R"]):
+            lab = QLabel(key); lab.setStyleSheet("font-size:10px; text-transform:uppercase;")
+            val = QLabel("0"); val.setStyleSheet("font-size:15px; font-weight:600; color:#9598a1;")
+            self.stats_grid.addWidget(lab, 2, i)
+            self.stats_grid.addWidget(val, 3, i)
             self.stat_labels[key] = val
         journal_col.addLayout(self.stats_grid)
 
@@ -1074,6 +1082,15 @@ class MainWindow(QMainWindow):
         self.stat_labels["Suma R"].setText(f"{sum_r:.2f}R")
         self.stat_labels["Expectancy"].setText(f"{expectancy:.2f}R")
 
+        adv = journal_stats.compute_advanced_stats(self.trades)
+        pf = adv["profit_factor"]
+        self.stat_labels["Profit Factor"].setText("∞" if pf == float("inf") else f"{pf:.2f}")
+        self.stat_labels["Sharpe"].setText(f"{adv['sharpe']:.2f}")
+        self.stat_labels["Racha Ganadora"].setText(str(adv["max_win_streak"]))
+        self.stat_labels["Racha Perdedora"].setText(str(adv["max_loss_streak"]))
+        self.stat_labels["Mejor R"].setText(f"{adv['best_r']:.2f}R")
+        self.stat_labels["Peor R"].setText(f"{adv['worst_r']:.2f}R")
+
     # ---------- sesiones ----------
     def _collect_session_state(self):
         """Captura todo el estado actual en un dict para guardar la sesión."""
@@ -1185,7 +1202,7 @@ class MainWindow(QMainWindow):
         for s in sessions:
             text = f"{s['name']}  —  {s['symbol']} {s['tf']}  ({s['trades']} trades)"
             list_widget.addItem(text)
-            list_widget.item(len(list_widget) - 1).setData(Qt.UserRole, s["path"])
+            list_widget.item(list_widget.count() - 1).setData(Qt.UserRole, s["path"])
         if list_widget.count() > 0:
             list_widget.setCurrentRow(0)
         layout.addWidget(list_widget)
@@ -1395,6 +1412,7 @@ class MainWindow(QMainWindow):
             "total": total, "wins": wins, "losses": losses,
             "winrate": winrate, "sum_r": sum_r, "expectancy": expectancy,
         }
+        stats.update(journal_stats.compute_advanced_stats(self.trades))
 
         try:
             pdf_export.build_pdf(path, self.trades, stats)

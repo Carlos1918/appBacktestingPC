@@ -40,6 +40,21 @@ def build_pdf(path, trades, stats, title="BacktestICT — Journal de Operaciones
     elements.append(Spacer(1, 3*mm))
 
     # ── stats cards ──
+    def stat_table(fields):
+        data = [[Paragraph(label, stat_header_style) for label, _ in fields]]
+        data.append([Paragraph(value, stat_value_style) for _, value in fields])
+        table = Table(data, colWidths=[doc.width / len(fields)] * len(fields))
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e222d")),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#d1d4dc")),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#2a2e39")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#3a3e49")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 1), (-1, 1), 8),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
+        ]))
+        return table
+
     stat_fields = [
         ("Total", str(stats.get("total", 0))),
         ("Ganadas", str(stats.get("wins", 0))),
@@ -48,20 +63,23 @@ def build_pdf(path, trades, stats, title="BacktestICT — Journal de Operaciones
         ("Suma R", f"{stats.get('sum_r', 0):.2f}R"),
         ("Expectancy", f"{stats.get('expectancy', 0):.2f}R"),
     ]
-    stat_data = [[Paragraph(label, stat_header_style) for label, _ in stat_fields]]
-    stat_data.append([Paragraph(value, stat_value_style) for _, value in stat_fields])
+    elements.append(stat_table(stat_fields))
+    elements.append(Spacer(1, 3*mm))
 
-    stat_table = Table(stat_data, colWidths=[doc.width / 6] * 6)
-    stat_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e222d")),
-        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#d1d4dc")),
-        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#2a2e39")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#3a3e49")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 1), (-1, 1), 8),
-        ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
-    ]))
-    elements.append(stat_table)
+    # Estadísticas avanzadas (profit factor, Sharpe por-trade, rachas, mejor/peor
+    # R) — ver core/stats.py. Solo se agregan si vienen en `stats` (compatibilidad
+    # con quien llame a build_pdf sin pasarlas).
+    if "profit_factor" in stats:
+        pf = stats.get("profit_factor", 0)
+        adv_fields = [
+            ("Profit Factor", "∞" if pf == float("inf") else f"{pf:.2f}"),
+            ("Sharpe", f"{stats.get('sharpe', 0):.2f}"),
+            ("Racha Ganadora", str(stats.get("max_win_streak", 0))),
+            ("Racha Perdedora", str(stats.get("max_loss_streak", 0))),
+            ("Mejor R", f"{stats.get('best_r', 0):.2f}R"),
+            ("Peor R", f"{stats.get('worst_r', 0):.2f}R"),
+        ]
+        elements.append(stat_table(adv_fields))
     elements.append(Spacer(1, 6*mm))
 
     # ── trades table ──

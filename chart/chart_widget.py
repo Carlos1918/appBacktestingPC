@@ -505,12 +505,18 @@ class ChartWidget(QWidget):
                 self._draw_pd_array(p, ict["pd_array"], w)
             if self.ict_show_fvg and ict.get("fvgs"):
                 self._draw_fvgs(p, ict["fvgs"])
-            if self.ict_show_ob and ict.get("order_blocks"):
-                self._draw_order_blocks(p, ict["order_blocks"])
-            if self.ict_show_mss and ict.get("choch"):
-                self._draw_choch(p, ict["choch"])
-            if self.ict_show_liquidity and ict.get("liquidity"):
-                self._draw_liquidity(p, ict["liquidity"], w)
+            if self.ict_show_ob:
+                if ict.get("swing_order_blocks"):
+                    self._draw_order_blocks(p, ict["swing_order_blocks"], internal=False)
+                if ict.get("internal_order_blocks"):
+                    self._draw_order_blocks(p, ict["internal_order_blocks"], internal=True)
+            if self.ict_show_mss:
+                if ict.get("swing_structure"):
+                    self._draw_structure(p, ict["swing_structure"], internal=False)
+                if ict.get("internal_structure"):
+                    self._draw_structure(p, ict["internal_structure"], internal=True)
+            if self.ict_show_liquidity and (ict.get("equal_highs") or ict.get("equal_lows")):
+                self._draw_equal_highs_lows(p, ict.get("equal_highs", []), ict.get("equal_lows", []), w)
             if self.ict_show_ote and ict.get("ote"):
                 self._draw_ote(p, ict["ote"])
             if self.ict_show_killzones:
@@ -1176,69 +1182,86 @@ class ChartWidget(QWidget):
             p.setPen(QColor(color))
             p.drawText(int(x - w2 / 2), int(y_top - 2), label)
 
-    def _draw_order_blocks(self, p, obs):
+    def _draw_order_blocks(self, p, obs, internal=False):
+        """Dibuja un order block como caja que se extiende desde su vela de
+        origen hasta el borde derecho visible -- igual que las cajas
+        'extend.right' de LuxAlgo. `internal` solo cambia el estilo (mas
+        sutil/delgado) para diferenciar el order block interno (micro) del
+        swing (macro), igual que el indicador de referencia."""
+        right_edge = self.view_start + self.view_count
         for ob in obs:
             idx = ob["idx"]
-            if idx < self.view_start or idx >= self.view_start + self.view_count:
+            if idx >= right_edge:
                 continue
-            x = self._x_of(idx, self.view_start, self._candle_w)
-            y_body_high = self._y_of(ob["body_high"])
-            y_body_low  = self._y_of(ob["body_low"])
+            x_left = self._x_of(max(idx, self.view_start), self.view_start, self._candle_w) - self._candle_w / 2
+            x_right = self._x_of(right_edge - 1, self.view_start, self._candle_w) + self._candle_w / 2
+            y_high = self._y_of(ob["high"])
+            y_low = self._y_of(ob["low"])
             color = "#26a69a" if ob["type"] == "bullish" else "#ef5350"
-            alpha = 15 if ob["mitigated"] else 30
-            fill = QColor(color); fill.setAlpha(alpha)
-            bw = self._candle_w * 1.2
-            p.fillRect(int(x - bw / 2), int(y_body_high), int(bw),
-                       max(int(y_body_low - y_body_high), 2), fill)
-            pen = QPen(QColor(color), 2)
+            fill = QColor(color)
+            fill.setAlpha(12 if internal else 30)
+            p.fillRect(int(x_left), int(y_high), max(int(x_right - x_left), 1), max(int(y_low - y_high), 2), fill)
+            pen = QPen(QColor(color), 1 if internal else 2, Qt.DashLine if internal else Qt.SolidLine)
             p.setPen(pen)
-            p.drawRect(int(x - bw / 2), int(y_body_high), int(bw),
-                       max(int(y_body_low - y_body_high), 2))
-            label = f"OB+ {ob['impulse_pct']:.1f}%" if ob["type"] == "bullish" else f"OB- {ob['impulse_pct']:.1f}%"
-            if ob["mitigated"]:
-                label += " mit"
+            p.drawRect(int(x_left), int(y_high), max(int(x_right - x_left), 1), max(int(y_low - y_high), 2))
+            label = ("iOB+" if internal else "OB+") if ob["type"] == "bullish" else ("iOB-" if internal else "OB-")
             p.setPen(QColor(color))
-            p.drawText(int(x - bw / 2), int(y_body_high - 2), label)
+            p.drawText(int(x_left) + 2, int(y_high) - 2, label)
 
-    def _draw_choch(self, p, choch_list):
-        for choch in choch_list:
-            if choch["idx"] < self.view_start or choch["idx"] >= self.view_start + self.view_count:
+    def _draw_structure(self, p, events, internal=False):
+        """Dibuja BOS (continuacion de tendencia) y CHoCH (giro) -- estructura
+        interna (micro, lookback corto) con linea punteada y etiqueta chica,
+        estructura swing (macro) con linea solida y etiqueta mas grande, igual
+        que la distincion visual del indicador de referencia."""
+        right_edge = self.view_start + self.view_count
+        for ev in events:
+            if ev["idx"] < self.view_start or ev["pivot_idx"] >= right_edge:
                 continue
-            x = self._x_of(choch["idx"], self.view_start, self._candle_w)
-            y = self._y_of(choch["level"])
-            color = "#26a69a" if choch["type"] == "bullish_choch" else "#ef5350"
-            pen = QPen(QColor(color), 2, Qt.DashDotLine)
+            x1 = self._x_of(max(ev["pivot_idx"], self.view_start), self.view_start, self._candle_w)
+            x2 = self._x_of(min(ev["idx"], right_edge - 1), self.view_start, self._candle_w)
+            y = self._y_of(ev["level"])
+            bullish = ev["type"].startswith("bullish")
+            is_choch = ev["type"].endswith("choch")
+            color = "#26a69a" if bullish else "#ef5350"
+            width = (1 if internal else 2)
+            style = Qt.DashLine if internal else Qt.DashDotLine if is_choch else Qt.SolidLine
+            pen = QPen(QColor(color), width, style)
             p.setPen(pen)
-            p.drawLine(int(x), int(y), int(x + 15), int(y))
+            p.drawLine(int(x1), int(y), int(x2), int(y))
             p.setPen(QColor(color))
-            label = "CHoCH ▲" if choch["type"] == "bullish_choch" else "CHoCH ▼"
-            p.drawText(int(x + 18), int(y - 2), label)
-            # linea vertical marcando la ruptura
-            pen.setStyle(Qt.DotLine)
-            p.setPen(pen)
-            p.drawLine(int(x), int(self._y_of(choch["level"])), int(x), int(self._y_of(self._min)))
+            tag = "CHoCH" if is_choch else "BOS"
+            prefix = "i" if internal else ""
+            arrow = "▲" if bullish else "▼"
+            p.drawText(int((x1 + x2) / 2), int(y - 2), f"{prefix}{tag} {arrow}")
 
-    def _draw_liquidity(self, p, liquidity, w):
-        for level in liquidity.get("buyside", []):
-            y = self._y_of(level["price"])
-            strength = level.get("strength", 1)
-            pen = QPen(QColor("#26a69a"), min(strength, 3))
-            pen.setStyle(Qt.DashLine)
+    def _draw_equal_highs_lows(self, p, equal_highs, equal_lows, w):
+        """Dibuja Equal Highs (EQH) / Equal Lows (EQL): dos pivots casi al
+        mismo precio -- una zona de liquidez, igual que el detector de
+        referencia (pivots consecutivos del mismo tipo a menos de un umbral de
+        ATR entre si)."""
+        right_edge = self.view_start + self.view_count
+        for eq in equal_highs:
+            if eq["idx2"] < self.view_start or eq["idx1"] >= right_edge:
+                continue
+            x1 = self._x_of(max(eq["idx1"], self.view_start), self.view_start, self._candle_w)
+            x2 = self._x_of(min(eq["idx2"], right_edge - 1), self.view_start, self._candle_w)
+            y = self._y_of(max(eq["price1"], eq["price2"]))
+            pen = QPen(QColor("#ef5350"), 1, Qt.DotLine)
             p.setPen(pen)
-            p.drawLine(PAD_L, int(y), w - PAD_R, int(y))
-            p.setPen(QColor("#26a69a"))
-            label = "BSL" + (" ═" * min(strength - 1, 2))
-            p.drawText(PAD_L + 2, int(y - 2), label)
-        for level in liquidity.get("sellside", []):
-            y = self._y_of(level["price"])
-            strength = level.get("strength", 1)
-            pen = QPen(QColor("#ef5350"), min(strength, 3))
-            pen.setStyle(Qt.DashLine)
-            p.setPen(pen)
-            p.drawLine(PAD_L, int(y), w - PAD_R, int(y))
+            p.drawLine(int(x1), int(y), int(x2), int(y))
             p.setPen(QColor("#ef5350"))
-            label = "SSL" + (" ═" * min(strength - 1, 2))
-            p.drawText(w - PAD_R - 70, int(y - 2), label)
+            p.drawText(int((x1 + x2) / 2), int(y - 2), "EQH")
+        for eq in equal_lows:
+            if eq["idx2"] < self.view_start or eq["idx1"] >= right_edge:
+                continue
+            x1 = self._x_of(max(eq["idx1"], self.view_start), self.view_start, self._candle_w)
+            x2 = self._x_of(min(eq["idx2"], right_edge - 1), self.view_start, self._candle_w)
+            y = self._y_of(min(eq["price1"], eq["price2"]))
+            pen = QPen(QColor("#26a69a"), 1, Qt.DotLine)
+            p.setPen(pen)
+            p.drawLine(int(x1), int(y), int(x2), int(y))
+            p.setPen(QColor("#26a69a"))
+            p.drawText(int((x1 + x2) / 2), int(y + 10), "EQL")
 
     def _draw_pd_array(self, p, pd, w):
         if pd is None:

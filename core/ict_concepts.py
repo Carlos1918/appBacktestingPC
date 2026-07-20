@@ -1,17 +1,38 @@
-"""Deteccion de conceptos ICT (Inner Circle Trader).
+"""Deteccion de conceptos ICT / Smart Money Concepts (SMC).
 
-Cada detector aplica criterios explicitos de la metodologia ICT para evitar
-falsos positivos. Ningun patron se marca solo porque los numeros se alinean
-por casualidad.
+La logica de este modulo replica, adaptada a listas de velas en Python, el
+indicador "Smart Money Concepts (SMC) [LuxAlgo]" (open-source, ~152K usos en
+TradingView -- la referencia de facto de la comunidad SMC/ICT). Cada funcion
+documenta a que parte del script Pine original corresponde para que se pueda
+verificar/actualizar contra la fuente.
+
+Conceptos que replica:
+  - Estructura de mercado interna (micro, lookback corto) y swing (macro,
+    lookback largo), cada una con BOS (Break of Structure, continuacion) y
+    CHoCH (Change of Character, giro) -- ver `_structure_breaks`.
+  - Order Blocks internos y swing, creados en cada ruptura de estructura sobre
+    la vela de extremo mas marcado del tramo previo, excluyendo velas de alta
+    volatilidad del calculo -- ver `_order_blocks`.
+  - Equal Highs / Equal Lows (liquidez): pivots consecutivos del mismo tipo a
+    menos de un umbral (fraccion de ATR) de distancia -- ver `_equal_highs_lows`.
+  - Fair Value Gap con umbral automatico basado en el movimiento historico
+    promedio -- ver `detect_fvgs`.
+  - Premium/Discount sobre el rango "trailing" (ultimo swing confirmado,
+    extendido por los maximos/minimos posteriores) -- ver `_trailing_extremes`.
+  - OTE (Optimal Trade Entry): no es parte del script de LuxAlgo, se mantiene
+    la implementacion propia ya verificada contra la metodologia ICT.
 """
 import datetime
 
-# ── parametros globales de sensibilidad ──
-MIN_GAP_FRAC  = 0.0002   # gap minimo del FVG como fraccion del precio
-MIN_IMPULSE   = 0.002    # impulso minimo para Order Block (0.2%)
-MIN_BODY_RATIO = 0.4     # cuerpo minimo de la vela OB respecto a su rango
-SWING_LOOKBACK = 3       # velas a cada lado para confirmar swing point
-CHoCH_LOOKAHEAD = 30     # max velas hacia adelante para buscar CHoCH
+# ── parametros (iguales a los valores por defecto de LuxAlgo) ──
+INTERNAL_LENGTH       = 5     # lookback de estructura interna (swingsLengthInput interno = 5 en LuxAlgo)
+SWING_LENGTH          = 50    # lookback de estructura swing/macro (swingsLengthInput = 50 por defecto)
+EQUAL_HL_LENGTH        = 3     # velas para confirmar un pivot de EQH/EQL (equalHighsLowsLengthInput)
+EQUAL_HL_THRESHOLD     = 0.1   # umbral en fracciones de ATR (equalHighsLowsThresholdInput)
+ATR_PERIOD             = 200   # ta.atr(200) en el original
+ORDER_BLOCK_VOL_MULT   = 2     # vela de alta volatilidad si (h-l) >= 2*ATR -- excluida del calculo de OB
+FVG_THRESHOLD_MULT     = 2     # umbral automatico del FVG = 2x el promedio historico del cuerpo
+MAX_ORDER_BLOCKS       = 5     # cuantos order blocks (mas recientes) se muestran, igual que LuxAlgo
 
 # ── Killzones (horario GMT) ──
 KILLZONES = {
@@ -28,292 +49,278 @@ def current_killzones(dt=None):
     return [name for name, (s, e) in KILLZONES.items() if s <= dt.hour < e]
 
 
-# ── utilidades ──
-def _body_pct(c):
-    rng = c["h"] - c["l"]
-    return abs(c["c"] - c["o"]) / rng if rng else 0
+# ── ATR (Wilder RMA, igual que ta.atr() de Pine) ──
+def _atr(candles, period=ATR_PERIOD):
+    n = len(candles)
+    atr = [0.0] * n
+    if n == 0:
+        return atr
+    tr = [0.0] * n
+    for i in range(n):
+        h, l = candles[i]["h"], candles[i]["l"]
+        prev_c = candles[i - 1]["c"] if i > 0 else candles[i]["o"]
+        tr[i] = max(h - l, abs(h - prev_c), abs(l - prev_c))
 
-def _range_pct(c):
-    return (c["h"] - c["l"]) / ((c["h"] + c["l"]) / 2) if (c["h"] + c["l"]) else 0
+    if n < period:
+        running = 0.0
+        for i in range(n):
+            running += tr[i]
+            atr[i] = running / (i + 1)
+        return atr
+
+    running = 0.0
+    for i in range(period - 1):
+        running += tr[i]
+        atr[i] = running / (i + 1)
+    seed = (running + tr[period - 1]) / period
+    atr[period - 1] = seed
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
 
 
-# ── FVG (Fair Value Gap) ──
-def detect_fvgs(candles, max_lookback=None):
-    """FVG real de ICT: 3 velas consecutivas donde las sombras de la vela 1 y 3
-    NO se solapan, dejando un 'hueco' o ineficiencia.
+# ── deteccion de pivots (swing points) por "leg" -- replica leg()/startOfNewLeg() ──
+def _leg_pivots(candles, size):
+    """Un pivot alto/bajo se confirma `size` velas despues de ocurrir, una vez
+    que ninguna de esas `size` velas siguientes supero su extremo (equivalente
+    a leg()/startOfNewLeg() del script original). Devuelve eventos en el orden
+    en que se CONFIRMAN (con `size` velas de retraso respecto a cuando
+    ocurrieron), cada uno con: kind ('high'/'low'), idx (indice real del
+    pivot), price, confirmed_idx (vela en la que se confirmo)."""
+    n = len(candles)
+    pivots = []
+    leg = 0  # 0 = pierna bajista (biscando un swing high), 1 = alcista (buscando swing low)
+    for i in range(size, n):
+        window_highs = [candles[j]["h"] for j in range(i - size + 1, i + 1)]
+        window_lows  = [candles[j]["l"] for j in range(i - size + 1, i + 1)]
+        new_leg_high = candles[i - size]["h"] > max(window_highs)
+        new_leg_low  = candles[i - size]["l"] < min(window_lows)
 
-    Reglas:
-      - 3 velas: c1 (i-2), c2 (i-1), c3 (i)
-      - Bullish FVG: c1.high < c3.low  (gap alcista entre c1 y c3)
-      - Bearish FVG: c1.low  > c3.high (gap bajista entre c1 y c3)
-      - El gap debe superar MIN_GAP_FRAC * precio_medio
-      - La vela 2 es la vela de impulso/desplazamiento que abre el hueco: debe
-        tener cuerpo en la MISMA direccion del gap (alcista para FVG alcista,
-        bajista para FVG bajista) -- no una vela de rechazo en contra. Un FVG
-        alcista real es, por definicion, producto de un movimiento fuerte hacia
-        arriba (vela 2 alcista); exigir lo contrario descartaba los FVG reales
-        y solo dejaba pasar configuraciones que no son FVG de verdad.
+        new_leg = leg
+        if new_leg_high:
+            new_leg = 0
+        elif new_leg_low:
+            new_leg = 1
+
+        if new_leg != leg:
+            pivot_idx = i - size
+            if new_leg == 1:
+                pivots.append({"kind": "low", "idx": pivot_idx, "price": candles[pivot_idx]["l"], "confirmed_idx": i})
+            else:
+                pivots.append({"kind": "high", "idx": pivot_idx, "price": candles[pivot_idx]["h"], "confirmed_idx": i})
+            leg = new_leg
+    return pivots
+
+
+# ── BOS / CHoCH -- replica displayStructure() ──
+def _structure_breaks(candles, pivots):
+    """Recorre las velas en orden cronologico manteniendo el ultimo pivot alto
+    y bajo vigente (se actualiza cada vez que `pivots` confirma uno nuevo) y el
+    sesgo de tendencia actual. Cuando el cierre cruza el pivot alto vigente (y
+    ese pivot no fue cruzado antes), es BOS si la tendencia ya era alcista, o
+    CHoCH si estaba bajista -- y simetrico para el pivot bajo. Replica
+    exactamente displayStructure()/getCurrentStructure() del script original."""
+    n = len(candles)
+    events = []
+    by_confirmed_idx = {}
+    for p in pivots:
+        by_confirmed_idx.setdefault(p["confirmed_idx"], []).append(p)
+
+    high_pivot = None
+    low_pivot = None
+    trend = 0  # 0 = sin sesgo aun, 1 = alcista, -1 = bajista
+
+    start = min((p["confirmed_idx"] for p in pivots), default=n)
+    for i in range(start, n):
+        for p in by_confirmed_idx.get(i, []):
+            if p["kind"] == "high":
+                high_pivot = {"idx": p["idx"], "price": p["price"], "crossed": False}
+            else:
+                low_pivot = {"idx": p["idx"], "price": p["price"], "crossed": False}
+
+        prev_close = candles[i - 1]["c"] if i > 0 else candles[i]["o"]
+
+        if high_pivot is not None and not high_pivot["crossed"]:
+            if prev_close <= high_pivot["price"] < candles[i]["c"]:
+                tag = "choch" if trend == -1 else "bos"
+                events.append({"type": f"bullish_{tag}", "idx": i, "level": high_pivot["price"], "pivot_idx": high_pivot["idx"]})
+                high_pivot["crossed"] = True
+                trend = 1
+
+        if low_pivot is not None and not low_pivot["crossed"]:
+            if prev_close >= low_pivot["price"] > candles[i]["c"]:
+                tag = "choch" if trend == 1 else "bos"
+                events.append({"type": f"bearish_{tag}", "idx": i, "level": low_pivot["price"], "pivot_idx": low_pivot["idx"]})
+                low_pivot["crossed"] = True
+                trend = -1
+
+    return events
+
+
+# ── Order Blocks -- replica storeOrdeBlock()/deleteOrderBlocks() ──
+def _order_blocks(candles, structure_events, atr):
+    """Cada BOS/CHoCH crea un order block sobre la vela de extremo mas marcado
+    del tramo [pivot_idx, break_idx) previo a la ruptura: la de low mas bajo
+    para rupturas alcistas, la de high mas alto para rupturas bajistas -- pero
+    usando 'parsed high/low', que excluye velas de alta volatilidad (rango >=
+    2x ATR) del calculo sustituyendo su high por su low (y viceversa), para
+    que un spike puntual no termine marcado como order block."""
+    n = len(candles)
+    parsed_high = [0.0] * n
+    parsed_low = [0.0] * n
+    for i in range(n):
+        h, l = candles[i]["h"], candles[i]["l"]
+        a = atr[i]
+        high_vol = a > 0 and (h - l) >= ORDER_BLOCK_VOL_MULT * a
+        parsed_high[i] = l if high_vol else h
+        parsed_low[i] = h if high_vol else l
+
+    blocks = []
+    for ev in structure_events:
+        pivot_idx, break_idx = ev["pivot_idx"], ev["idx"]
+        if break_idx <= pivot_idx:
+            continue
+        bias = "bullish" if ev["type"].startswith("bullish") else "bearish"
+
+        if bias == "bearish":
+            segment = parsed_high[pivot_idx:break_idx]
+            rel = segment.index(max(segment))
+        else:
+            segment = parsed_low[pivot_idx:break_idx]
+            rel = segment.index(min(segment))
+        ob_idx = pivot_idx + rel
+
+        blocks.append({
+            "type": bias,
+            "idx": ob_idx,
+            "high": candles[ob_idx]["h"],
+            "low": candles[ob_idx]["l"],
+            "structure_idx": break_idx,
+            "mitigated": False,
+        })
+
+    # mitigacion: se usa el rango completo (high/low) de la vela, no el cuerpo
+    # -- un OB bajista se invalida cuando el precio rompe por encima de su
+    # high, uno alcista cuando rompe por debajo de su low.
+    for ob in blocks:
+        for c in candles[ob["structure_idx"] + 1:]:
+            if ob["type"] == "bearish" and c["h"] > ob["high"]:
+                ob["mitigated"] = True
+                break
+            if ob["type"] == "bullish" and c["l"] < ob["low"]:
+                ob["mitigated"] = True
+                break
+
+    # solo se muestran los N mas recientes (no mitigados primero), igual que
+    # el limite "Order Blocks to display" de LuxAlgo (5 por defecto)
+    unmitigated = [b for b in blocks if not b["mitigated"]]
+    unmitigated.sort(key=lambda b: b["idx"], reverse=True)
+    return unmitigated[:MAX_ORDER_BLOCKS]
+
+
+# ── Equal Highs / Equal Lows -- replica el modo equalHighLow de getCurrentStructure() ──
+def _equal_highs_lows(candles, atr, length=EQUAL_HL_LENGTH, threshold=EQUAL_HL_THRESHOLD):
+    """Usa el mismo detector de pivots que la estructura, pero con un lookback
+    corto, y compara cada pivot nuevo contra el INMEDIATAMENTE anterior del
+    mismo tipo: si estan a menos de threshold*ATR de distancia, se marcan como
+    'iguales' -- una zona de liquidez (EQH si son highs, EQL si son lows)."""
+    pivots = _leg_pivots(candles, length)
+    eqh, eql = [], []
+    last_high = last_low = None
+
+    for p in pivots:
+        a = atr[p["confirmed_idx"]]
+        if p["kind"] == "high":
+            if last_high is not None and a > 0 and abs(last_high["price"] - p["price"]) < threshold * a:
+                eqh.append({
+                    "idx1": last_high["idx"], "idx2": p["idx"],
+                    "price1": last_high["price"], "price2": p["price"],
+                    "confirmed_idx": p["confirmed_idx"],
+                })
+            last_high = p
+        else:
+            if last_low is not None and a > 0 and abs(last_low["price"] - p["price"]) < threshold * a:
+                eql.append({
+                    "idx1": last_low["idx"], "idx2": p["idx"],
+                    "price1": last_low["price"], "price2": p["price"],
+                    "confirmed_idx": p["confirmed_idx"],
+                })
+            last_low = p
+
+    return eqh, eql
+
+
+# ── Fair Value Gap (FVG) -- replica drawFairValueGaps()/deleteFairValueGaps() ──
+def detect_fvgs(candles, threshold_mult=FVG_THRESHOLD_MULT, auto_threshold=True):
+    """FVG de 3 velas: c1 (i-2), c2 (i-1, vela de impulso), c3 (i).
+
+    Reglas (igual que LuxAlgo):
+      - Bullish: c3.low > c1.high (hueco alcista) Y c2.close > c1.high
+        (el cierre de la vela de impulso tambien supera el extremo de c1)
+        Y el cuerpo de c2 (en %) supera el umbral.
+      - Bearish: simetrico, con c3.high < c1.low y c2.close < c1.low.
+      - Umbral automatico: 2x el promedio historico acumulado del |cuerpo%|
+        de todas las velas hasta ese punto (en vez de un % fijo arbitrario) --
+        asi el filtro se adapta a la volatilidad real del simbolo/timeframe.
+      - Mitigacion: replica exactamente la asimetria del original -- un FVG
+        alcista se invalida cuando el precio perfora POR COMPLETO hacia abajo
+        (low < limite inferior del hueco), uno bajista se invalida en cuanto
+        el precio toca el limite inferior del hueco desde abajo (high > ese
+        mismo limite). No es simetrico en el original tampoco; se mantiene tal
+        cual para ser fiel a la referencia.
     """
     n = len(candles)
     results = []
-    start = max(2, (n - max_lookback) if max_lookback else 2)
-    for i in range(start, n):
-        c1, c2, c3 = candles[i-2], candles[i-1], candles[i]
-        avg_price = (c1["h"] + c1["l"] + c3["h"] + c3["l"]) / 4
-        min_gap = avg_price * MIN_GAP_FRAC
+    if n < 3:
+        return results
 
-        # Bullish FVG: gap al alza, c2 alcista (vela de impulso)
-        gap = c3["l"] - c1["h"]
-        if gap > min_gap and c2["c"] > c2["o"]:
+    body_pct = [0.0] * n
+    for i in range(n):
+        o = candles[i]["o"]
+        body_pct[i] = (candles[i]["c"] - o) / o if o else 0.0
+
+    running_avg_abs = [0.0] * n
+    cum_abs = 0.0
+    for i in range(n):
+        cum_abs += abs(body_pct[i])
+        running_avg_abs[i] = cum_abs / (i + 1)
+
+    for i in range(2, n):
+        c1, c2, c3 = candles[i - 2], candles[i - 1], candles[i]
+        mid_body_pct = body_pct[i - 1]
+        threshold = threshold_mult * running_avg_abs[i - 1] if auto_threshold else 0.0
+
+        if c3["l"] > c1["h"] and c2["c"] > c1["h"] and mid_body_pct > threshold:
+            gap_high, gap_low = c3["l"], c1["h"]
             results.append({
-                "type": "bullish",
-                "idx": i - 1,
-                "gap_high": c3["l"],
-                "gap_low":  c1["h"],
-                "gap_size": gap,
-                "mitigated": False,
+                "type": "bullish", "idx": i - 1,
+                "gap_high": gap_high, "gap_low": gap_low,
+                "gap_size": gap_high - gap_low, "mitigated": False,
             })
             continue
 
-        # Bearish FVG: gap a la baja, c2 bajista (vela de impulso)
-        gap = c1["l"] - c3["h"]
-        if gap > min_gap and c2["c"] < c2["o"]:
+        if c3["h"] < c1["l"] and c2["c"] < c1["l"] and -mid_body_pct > threshold:
+            gap_high, gap_low = c1["l"], c3["h"]
             results.append({
-                "type": "bearish",
-                "idx": i - 1,
-                "gap_high": c1["l"],
-                "gap_low":  c3["h"],
-                "gap_size": gap,
-                "mitigated": False,
+                "type": "bearish", "idx": i - 1,
+                "gap_high": gap_high, "gap_low": gap_low,
+                "gap_size": gap_high - gap_low, "mitigated": False,
             })
 
-    # Marcar FVGs mitigados (el precio volvio a la zona del gap)
     for fvg in results:
-        gh, gl = fvg["gap_high"], fvg["gap_low"]
+        gl = fvg["gap_low"]
         for c in candles[fvg["idx"] + 1:]:
-            if c["l"] <= gh and c["h"] >= gl:
+            if fvg["type"] == "bullish" and c["l"] < gl:
+                fvg["mitigated"] = True
+                break
+            if fvg["type"] == "bearish" and c["h"] > gl:
                 fvg["mitigated"] = True
                 break
 
     return results
 
 
-# ── Order Block (OB) ──
-def detect_order_blocks(candles, lookback=60):
-    """Order Block ICT: la ULTIMA vela en direccion opuesta antes de un
-    impulso fuerte de 3+ velas consecutivas en la misma direccion.
-
-    Reglas:
-      - Bullish OB: vela bajista (o con cuerpo pequenio) seguida de 3 velas
-        alcistas consecutivas con impulso agregado > MIN_IMPULSE
-      - Bearish OB: vela alcista seguida de 3 velas bajistas consecutivas
-      - La OB debe tener cuerpo significativo (MIN_BODY_RATIO)
-      - El impulso debe ser >= MIN_IMPULSE desde el cierre de la OB
-      - Solo la ULTIMA vela contraria se marca (no todas las del medio)
-    """
-    n = len(candles)
-    results = []
-    start = max(1, n - lookback) if lookback else 1
-
-    i = start
-    while i < n - 3:
-        ob_candle = candles[i]
-        body_ratio = _body_pct(ob_candle)
-
-        if body_ratio < MIN_BODY_RATIO:
-            i += 1
-            continue
-
-        # Busca impulso de 3 velas en direccion contraria
-        if ob_candle["c"] < ob_candle["o"]:  # bajista -> posible OB alcista
-            if all(candles[i + j]["c"] > candles[i + j]["o"] for j in range(1, 4)):
-                move = (candles[i + 3]["c"] - ob_candle["c"]) / ob_candle["c"]
-                if move > MIN_IMPULSE:
-                    # Asegurar que es la ULTIMA bajista antes del impulso
-                    if i == 0 or candles[i - 1]["c"] >= candles[i - 1]["o"]:
-                        results.append({
-                            "type": "bullish",
-                            "idx": i,
-                            "high": ob_candle["h"],
-                            "low":  ob_candle["l"],
-                            "body_high": max(ob_candle["o"], ob_candle["c"]),
-                            "body_low":  min(ob_candle["o"], ob_candle["c"]),
-                            "impulse_pct": move * 100,
-                            "mitigated": False,
-                        })
-                        i += 3
-                        continue
-
-        elif ob_candle["c"] > ob_candle["o"]:  # alcista -> posible OB bajista
-            if all(candles[i + j]["c"] < candles[i + j]["o"] for j in range(1, 4)):
-                move = (ob_candle["c"] - candles[i + 3]["c"]) / ob_candle["c"]
-                if move > MIN_IMPULSE:
-                    if i == 0 or candles[i - 1]["c"] <= candles[i - 1]["o"]:
-                        results.append({
-                            "type": "bearish",
-                            "idx": i,
-                            "high": ob_candle["h"],
-                            "low":  ob_candle["l"],
-                            "body_high": max(ob_candle["o"], ob_candle["c"]),
-                            "body_low":  min(ob_candle["o"], ob_candle["c"]),
-                            "impulse_pct": move * 100,
-                            "mitigated": False,
-                        })
-                        i += 3
-                        continue
-        i += 1
-
-    # Marcar OBs mitigados (el precio volvio al cuerpo de la OB)
-    for ob in results:
-        bh, bl = ob["body_high"], ob["body_low"]
-        for c in candles[ob["idx"] + 1:]:
-            if c["l"] <= bh and c["h"] >= bl:
-                ob["mitigated"] = True
-                break
-
-    return results
-
-
-# ── Market Structure (Swing Points) ──
-def find_swing_points(candles, left=None, right=None, max_lookback=None):
-    """Swing highs/lows de ICT. Requiere al menos `left` velas mas altas/bajas
-    a cada lado para confirmar el punto de giro.
-
-    Devuelve (swing_highs, swing_lows) ordenados por indice.
-    """
-    left = left or SWING_LOOKBACK
-    right = right or SWING_LOOKBACK
-    n = len(candles)
-    highs, lows = [], []
-    start = (max_lookback or 0) + left
-    end = n - right
-
-    for i in range(start, end):
-        hi = candles[i]["h"]
-        lo = candles[i]["l"]
-
-        is_high = all(hi > candles[j]["h"] for j in range(i - left, i)) and \
-                  all(hi > candles[j]["h"] for j in range(i + 1, i + right + 1))
-        is_low  = all(lo < candles[j]["l"] for j in range(i - left, i)) and \
-                  all(lo < candles[j]["l"] for j in range(i + 1, i + right + 1))
-
-        if is_high and is_low:
-            # Si es ambas, priorizar segun el rango mayor
-            rng_high = hi - candles[i]["l"]
-            rng_low  = candles[i]["h"] - lo
-            if rng_high >= rng_low:
-                highs.append({"idx": i, "price": hi})
-            else:
-                lows.append({"idx": i, "price": lo})
-        elif is_high:
-            highs.append({"idx": i, "price": hi})
-        elif is_low:
-            lows.append({"idx": i, "price": lo})
-
-    return highs, lows
-
-
-# ── CHoCH / MSS (Change of Character / Market Structure Shift) ──
-def detect_choch(candles, swing_highs, swing_lows, lookahead=None):
-    """Change of Character ICT — corregido.
-
-    1. Toma los ULTIMOS 2 swing highs y 2 swing lows.
-    2. Determina la estructura:
-       - Alcista: HH (sh[1] > sh[0]) y HL (sl[1] > sl[0])
-       - Bajista: LH (sh[1] < sh[0]) y LL (sl[1] < sl[0])
-    3. CHoCH ocurre cuando se rompe el ultimo nivel de la estructura:
-       - Bajista (rompe tendencia alcista): precio CIERRA debajo del ultimo HL
-       - Alcista (rompe tendencia bajista): precio CIERRA encima del ultimo LH
-
-    Usa el cierre en vez del high/low para evitar que una sombra momentanea
-    active un falso CHoCH.
-    """
-    lookahead = lookahead or CHoCH_LOOKAHEAD
-    n = len(candles)
-    results = []
-
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return results
-
-    sh = swing_highs[-2:]  # ultimos 2 swing highs
-    sl = swing_lows[-2:]   # ultimos 2 swing lows
-
-    is_uptrend   = sh[1]["price"] > sh[0]["price"] and sl[1]["price"] > sl[0]["price"]
-    is_downtrend = sh[1]["price"] < sh[0]["price"] and sl[1]["price"] < sl[0]["price"]
-
-    # Bearish CHoCH: tendencia alcista, se pierde el ultimo HL (cierre debajo)
-    if is_uptrend:
-        hl_level, hl_idx = sl[-1]["price"], sl[-1]["idx"]
-        for i in range(hl_idx + 1, min(hl_idx + lookahead, n)):
-            if candles[i]["c"] < hl_level:
-                results.append({
-                    "type": "bearish_choch",
-                    "idx": i,
-                    "level": hl_level,
-                    "direction": "down",
-                })
-                break
-
-    # Bullish CHoCH: tendencia bajista, se pierde el ultimo LH (cierre encima)
-    if is_downtrend:
-        lh_level, lh_idx = sh[-1]["price"], sh[-1]["idx"]
-        for i in range(lh_idx + 1, min(lh_idx + lookahead, n)):
-            if candles[i]["c"] > lh_level:
-                results.append({
-                    "type": "bullish_choch",
-                    "idx": i,
-                    "level": lh_level,
-                    "direction": "up",
-                })
-                break
-
-    return results
-
-
-# ── Liquidez (Buyside / Sellside) ──
-def detect_liquidity(swing_highs, swing_lows, max_points=4):
-    """Niveles de liquidez ICT.
-
-    - Buyside liquidity: encima de swing highs relevantes (max 4)
-    - Sellside liquidity: debajo de swing lows relevantes (max 4)
-
-    Solo se muestran niveles donde hayan AL MENOS 2 swing points cerca
-    (formando un "double top/bottom" de liquidez) o el swing mas reciente.
-    """
-    # Agrupar swing highs cercanos (dentro del 0.1% de distancia)
-    def cluster(swings, price_key, threshold=0.001):
-        if not swings:
-            return []
-        clustered = []
-        used = set()
-        for i, s1 in enumerate(swings):
-            if i in used:
-                continue
-            group = [s1]
-            used.add(i)
-            for j, s2 in enumerate(swings):
-                if j in used or j == i:
-                    continue
-                if abs(s2[price_key] - s1[price_key]) / max(s1[price_key], 0.0001) < threshold:
-                    group.append(s2)
-                    used.add(j)
-            # Solo mostrar si hay cluster (2+) o es el mas reciente
-            if len(group) >= 2 or i == len(swings) - 1:
-                avg_price = sum(s[price_key] for s in group) / len(group)
-                clustered.append({
-                    "idx": max(s["idx"] for s in group),
-                    "price": avg_price,
-                    "strength": len(group),
-                })
-        return clustered[-max_points:]
-
-    buyside  = cluster(swing_highs, "price") if swing_highs else []
-    sellside = cluster(swing_lows,  "price") if swing_lows else []
-
-    return {"buyside": buyside, "sellside": sellside}
-
-
-# ── Premium / Discount ──
+# ── Premium / Discount (rango "trailing") -- replica updateTrailingExtremes() ──
 def calc_pd_array(high, low):
     """Zona Premium/Discount ICT a partir de un rango dado.
 
@@ -333,82 +340,103 @@ def calc_pd_array(high, low):
     }
 
 
+def _trailing_extremes(candles, swing_pivots):
+    """Rango vigente de negociacion: arranca en el ultimo swing high/low
+    confirmado (lookback SWING_LENGTH) y se extiende con el maximo/minimo de
+    las velas siguientes hasta que un nuevo swing del mismo tipo lo reemplaza
+    -- exactamente updateTrailingExtremes() + los resets dentro de
+    getCurrentStructure() del script original. Devuelve (top, bottom) segun el
+    estado al final del historial dado, o (None, None) si no hay suficientes
+    datos."""
+    n = len(candles)
+    by_confirmed_idx = {}
+    for p in swing_pivots:
+        by_confirmed_idx.setdefault(p["confirmed_idx"], []).append(p)
+
+    top = bottom = None
+    for i in range(n):
+        if top is not None:
+            top = max(top, candles[i]["h"])
+        if bottom is not None:
+            bottom = min(bottom, candles[i]["l"])
+        for p in by_confirmed_idx.get(i, []):
+            if p["kind"] == "high":
+                top = p["price"]
+            else:
+                bottom = p["price"]
+
+    return top, bottom
+
+
 # ── OTE (Optimal Trade Entry) ──
+# No es parte del script de LuxAlgo (esa herramienta no incluye OTE) -- se
+# mantiene la logica propia, ya verificada: zona 61.8%-79% medida HACIA ATRAS
+# desde el extremo mas reciente del tramo (discount para bullish, premium para
+# bearish), que es como ICT ensenia a leer el retroceso.
 def calc_ote(high, low, kind="bullish"):
-    """Zona OTE ICT: Fibonacci 0.618 - 0.79 de un movimiento, medido HACIA ATRAS
-    desde el extremo mas reciente del tramo (asi es como se lee el retroceso:
-    62%/79% es cuanto retrocedio el precio desde ese extremo, no cuanto avanzo
-    desde el origen del tramo).
-
-    - Bullish (tramo alcista low->high, se espera un retroceso para comprar):
-      se mide hacia atras desde el high. Cae por debajo del equilibrio (zona de
-      descuento) -- que es justamente donde ICT ensenia a comprar.
-    - Bearish (tramo bajista high->low, se espera un retroceso para vender):
-      se mide hacia atras desde el low. Cae por encima del equilibrio (zona de
-      premium) -- donde ICT ensenia a vender.
-
-    Antes esta funcion ignoraba `kind` por completo y siempre devolvia
-    low + rango*0.618..0.79, que cae en la mitad PREMIUM del rango (por encima
-    del equilibrio) -- es decir, marcaba la zona de compra justo en el lado
-    equivocado del rango.
-    """
     if high == low:
         return None
     rng = high - low
     if kind == "bullish":
         f618 = high - rng * 0.618
-        f79  = high - rng * 0.79
+        f79 = high - rng * 0.79
     else:
         f618 = low + rng * 0.618
-        f79  = low + rng * 0.79
+        f79 = low + rng * 0.79
     return {"high": max(f618, f79), "low": min(f618, f79)}
 
 
 # ── Detector completo ──
 def detect_all(candles):
-    """Ejecuta todas las detecciones ICT con parametros estrictos.
-
-    Retorna dict con todas las detecciones o None si no hay suficientes datos.
-    """
+    """Ejecuta todas las detecciones ICT/SMC replicando la logica del
+    indicador de referencia (LuxAlgo). Retorna dict con todas las detecciones,
+    o {} si no hay suficientes datos."""
     if not candles or len(candles) < 20:
         return {}
 
-    swing_highs, swing_lows = find_swing_points(candles)
-    fvgs    = detect_fvgs(candles)
-    obs     = detect_order_blocks(candles)
-    choch   = detect_choch(candles, swing_highs, swing_lows)
-    liq     = detect_liquidity(swing_highs, swing_lows)
+    atr = _atr(candles)
 
-    # Rango de negociacion (dealing range) para Premium/Discount y OTE: el
-    # tramo entre el swing high y el swing low mas recientes -- no un lookback
-    # arbitrario de N velas, que puede cortar un tramo a la mitad o mezclar
-    # varios tramos sin relacion entre si. El swing point mas reciente
-    # (cronologicamente) marca el sesgo: si el ultimo es un low, el tramo mas
-    # reciente fue bajista y ahora se espera un retroceso alcista (OTE de
-    # compra); si el ultimo es un high, fue alcista y se espera un retroceso
-    # bajista (OTE de venta).
-    pd = None
-    ote = None
-    if swing_highs and swing_lows:
-        last_sh = swing_highs[-1]
-        last_sl = swing_lows[-1]
-        move_high = max(last_sh["price"], last_sl["price"])
-        move_low  = min(last_sh["price"], last_sl["price"])
-        if move_high != move_low:
-            pd = calc_pd_array(move_high, move_low)
-            kind = "bullish" if last_sl["idx"] > last_sh["idx"] else "bearish"
-            ote = calc_ote(move_high, move_low, kind)
+    internal_pivots = _leg_pivots(candles, INTERNAL_LENGTH)
+    internal_structure = _structure_breaks(candles, internal_pivots)
+    internal_order_blocks = _order_blocks(candles, internal_structure, atr)
+
+    swing_pivots = _leg_pivots(candles, SWING_LENGTH)
+    swing_structure = _structure_breaks(candles, swing_pivots)
+    swing_order_blocks = _order_blocks(candles, swing_structure, atr)
+
+    fvgs = detect_fvgs(candles)
+    equal_highs, equal_lows = _equal_highs_lows(candles, atr)
+
+    top, bottom = _trailing_extremes(candles, swing_pivots)
+    pd = calc_pd_array(top, bottom) if top is not None and bottom is not None else None
     if pd is None:
         last_60 = candles[-60:] if len(candles) >= 60 else candles
         pd = calc_pd_array(max(c["h"] for c in last_60), min(c["l"] for c in last_60))
 
+    # OTE: usa el ultimo swing high y el ultimo swing low confirmados: el que
+    # haya ocurrido MAS RECIENTE (por indice) marca el sesgo del tramo actual.
+    ote = None
+    swing_highs_list = [p for p in swing_pivots if p["kind"] == "high"]
+    swing_lows_list = [p for p in swing_pivots if p["kind"] == "low"]
+    if swing_highs_list and swing_lows_list:
+        last_sh = swing_highs_list[-1]
+        last_sl = swing_lows_list[-1]
+        move_high = max(last_sh["price"], last_sl["price"])
+        move_low = min(last_sh["price"], last_sl["price"])
+        if move_high != move_low:
+            kind = "bullish" if last_sl["idx"] > last_sh["idx"] else "bearish"
+            ote = calc_ote(move_high, move_low, kind)
+
     return {
-        "fvgs":         fvgs,
-        "order_blocks": obs,
-        "swing_highs":  swing_highs,
-        "swing_lows":   swing_lows,
-        "choch":        choch,
-        "liquidity":    liq,
-        "pd_array":     pd,
-        "ote":          ote,
+        "internal_structure": internal_structure,
+        "swing_structure": swing_structure,
+        "internal_order_blocks": internal_order_blocks,
+        "swing_order_blocks": swing_order_blocks,
+        "fvgs": fvgs,
+        "equal_highs": equal_highs,
+        "equal_lows": equal_lows,
+        "swing_highs": [{"idx": p["idx"], "price": p["price"]} for p in swing_highs_list],
+        "swing_lows": [{"idx": p["idx"], "price": p["price"]} for p in swing_lows_list],
+        "pd_array": pd,
+        "ote": ote,
     }
