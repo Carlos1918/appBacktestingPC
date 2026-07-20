@@ -1085,13 +1085,28 @@ class ChartWidget(QWidget):
         def time_to_idx(t):
             if t is None or not new_candles:
                 return 0
+
+            # Anterior a la primera vela descargada (el rango recargado no
+            # llega tan atrás como donde estaba el dibujo -- p. ej. el
+            # histórico del bróker no alcanza, o el fallback por cantidad de
+            # velas trajo solo las más recientes): extrapolar hacia ATRÁS con
+            # la duración real de vela, igual que ya se hacía para el caso
+            # "futuro". Antes esto aplastaba el punto al índice 0 sin más,
+            # deformando la distancia real entre los dos extremos del dibujo.
+            if t < new_candles[0]["t"]:
+                target = parse_dt(t)
+                edge = parse_dt(new_candles[0]["t"])
+                if target is not None and edge is not None and tf_seconds:
+                    extra_bars = int((edge - target).total_seconds() / tf_seconds)
+                    return -max(extra_bars, 1)
+                return 0
+
             for i, c in enumerate(new_candles):
                 if c["t"] >= t:
                     return i
-            # Fuera del rango descargado (más reciente que la última vela, o más
-            # antiguo que la primera): en vez de aplastar todo al mismo índice,
-            # extrapolamos usando la duración real de vela del timeframe nuevo,
-            # así se conserva la distancia relativa entre los dos puntos del dibujo.
+            # Posterior a la última vela descargada: extrapolar hacia
+            # adelante con la duración real de vela del timeframe nuevo, así
+            # se conserva la distancia relativa entre los dos puntos del dibujo.
             target = parse_dt(t)
             edge = parse_dt(new_candles[-1]["t"])
             if target is not None and edge is not None and tf_seconds:

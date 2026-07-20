@@ -1270,7 +1270,20 @@ class MainWindow(QMainWindow):
             self.symbol_combo.clear()
             self.symbol_combo.addItems(mt5_data.list_symbols())
             self.symbol_combo.setEnabled(True)
+            # Sin esto, el combo quedaba mostrando cualquier símbolo (el
+            # primero de la lista tras el addItems) en vez del que trae la
+            # sesión -- y como on_fetch_mt5()/on_tf_combo_changed() usan
+            # symbol_combo.currentText() para saber qué pedir, cambiar de
+            # timeframe después de cargar una sesión pedía el símbolo
+            # equivocado (o no hacía nada si el combo quedaba vacío).
+            self.symbol_combo.setCurrentText(symbol)
             self.btn_fetch.setEnabled(True)
+            # Igual para el combo de TF: bloqueando señales porque si el
+            # texto cambia (p. ej. de "M15" a "H4") dispararía
+            # on_tf_combo_changed() a mitad de esta misma carga de sesión.
+            self.tf_combo.blockSignals(True)
+            self.tf_combo.setCurrentText(tf)
+            self.tf_combo.blockSignals(False)
 
             first_time = state.get("first_candle_time")
             last_time = state.get("last_candle_time")
