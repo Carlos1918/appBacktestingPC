@@ -827,7 +827,7 @@ class ChartWidget(QWidget):
             else:
                 handle = self._hit_test_handles(pos)
                 shift_held = bool(event.modifiers() & Qt.ShiftModifier)
-                if handle and handle["handle"] == "move" and handle["kind"] != "hline" and not shift_held:
+                if handle and handle["handle"] == "move" and handle["kind"] not in self._FREE_MOVE_KINDS and not shift_held:
                     handle = None
                 cursor_map = {
                     "move": Qt.SizeAllCursor, "left": Qt.SizeHorCursor, "right": Qt.SizeHorCursor,
@@ -886,7 +886,7 @@ class ChartWidget(QWidget):
                 return
             handle = self._hit_test_handles(pos)
             shift_held = bool(event.modifiers() & Qt.ShiftModifier)
-            if handle and handle["handle"] == "move" and handle["kind"] != "hline" and not shift_held:
+            if handle and handle["handle"] == "move" and handle["kind"] not in self._FREE_MOVE_KINDS and not shift_held:
                 handle = None
             if handle:
                 obj = getattr(self, self._KIND_LISTS[handle["kind"]])[handle["idx"]]
@@ -1067,6 +1067,11 @@ class ChartWidget(QWidget):
         "rr_box": "caja R:R", "fib": "Fibonacci",
     }
     _COLORABLE_KINDS = {"hline", "trend", "rect"}
+    # hline y rr_box no tienen bordes propios para redimensionar (el rr_box
+    # tiene handles dedicados: entry/sl/tp/left/right), asi que mover el
+    # cuerpo con un clic normal no genera ambiguedad con hacer pan del
+    # grafico como si pasa con rect/trend -- no necesitan Shift.
+    _FREE_MOVE_KINDS = {"hline", "rr_box"}
 
     def _delete_drawing(self, kind, idx):
         del getattr(self, self._KIND_LISTS[kind])[idx]
@@ -1145,7 +1150,8 @@ class ChartWidget(QWidget):
             ],
             "rr_boxes": [
                 {"t1": idx_to_time(b["i1"]), "t2": idx_to_time(b["i2"]), "entry": b["entry"],
-                 "sl": b["sl"], "tp": b["tp"], "kind": b["kind"], "ratio": b["ratio"]}
+                 "sl": b["sl"], "tp": b["tp"], "kind": b["kind"], "ratio": b["ratio"],
+                 "bars_width": b["i2"] - b["i1"]}
                 for b in self.rr_boxes
             ],
         }
@@ -1204,11 +1210,19 @@ class ChartWidget(QWidget):
             {"i1": time_to_idx(f["t1"]), "p1": f["p1"], "i2": time_to_idx(f["t2"]), "p2": f["p2"]}
             for f in data.get("fibs", [])
         ]
-        self.rr_boxes = [
-            {"i1": time_to_idx(b["t1"]), "i2": time_to_idx(b["t2"]), "entry": b["entry"],
-             "sl": b["sl"], "tp": b["tp"], "kind": b["kind"], "ratio": b["ratio"]}
-            for b in data.get("rr_boxes", [])
-        ]
+        self.rr_boxes = []
+        for b in data.get("rr_boxes", []):
+            i1 = time_to_idx(b["t1"])
+            # El ancho en barras se preserva tal cual (en vez de re-derivar i2
+            # desde t2 con el timeframe nuevo) para que la caja no se achique
+            # al cambiar de temporalidad: una vela H1 abarca mucho mas tiempo
+            # real que una M15, y recalcular por tiempo la aplastaba.
+            bars_width = b.get("bars_width")
+            i2 = i1 + bars_width if bars_width is not None else time_to_idx(b["t2"])
+            self.rr_boxes.append({
+                "i1": i1, "i2": i2, "entry": b["entry"], "sl": b["sl"], "tp": b["tp"],
+                "kind": b["kind"], "ratio": b["ratio"],
+            })
         self.update()
 
     def clear_drawings(self):
