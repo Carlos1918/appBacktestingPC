@@ -777,7 +777,7 @@ class ChartWidget(QWidget):
             else:
                 handle = self._hit_test_handles(pos)
                 shift_held = bool(event.modifiers() & Qt.ShiftModifier)
-                if handle and handle["handle"] == "move" and not shift_held:
+                if handle and handle["handle"] == "move" and handle["kind"] != "hline" and not shift_held:
                     handle = None
                 cursor_map = {
                     "move": Qt.SizeAllCursor, "left": Qt.SizeHorCursor, "right": Qt.SizeHorCursor,
@@ -835,7 +835,7 @@ class ChartWidget(QWidget):
                 return
             handle = self._hit_test_handles(pos)
             shift_held = bool(event.modifiers() & Qt.ShiftModifier)
-            if handle and handle["handle"] == "move" and not shift_held:
+            if handle and handle["handle"] == "move" and handle["kind"] != "hline" and not shift_held:
                 handle = None
             if handle:
                 obj = getattr(self, self._KIND_LISTS[handle["kind"]])[handle["idx"]]
