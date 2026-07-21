@@ -1034,9 +1034,8 @@ class ChartWidget(QWidget):
         return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
 
     def _find_drawing_at(self, pos):
-        """Busca el dibujo más cercano al punto `pos` (para editar con clic derecho).
-        Cubre líneas horizontales, tendencias y rectángulos; Fibonacci y cajas R:R
-        se editan hoy solo borrando todos los dibujos (roadmap: extender aquí)."""
+        """Busca el dibujo más cercano al punto `pos` (para editar/borrar con clic
+        derecho o Backspace/Supr). Cubre los 5 tipos de dibujo."""
         x, y = pos.x(), pos.y()
         candle_w = self._candle_w or 10
         threshold = 8
@@ -1064,10 +1063,39 @@ class ChartWidget(QWidget):
             if near_left or near_right or near_top or near_bot:
                 return ("rect", i)
 
+        for i, f in enumerate(self.fibs):
+            x_l = min(self._x_of(f["i1"], self.view_start, candle_w), self._x_of(f["i2"], self.view_start, candle_w))
+            x_r = max(self._x_of(f["i1"], self.view_start, candle_w), self._x_of(f["i2"], self.view_start, candle_w))
+            if not (x_l - threshold <= x <= x_r + threshold):
+                continue
+            rng = f["p2"] - f["p1"]
+            for lvl in FIB_LEVELS:
+                price = f["p1"] + rng * lvl
+                if abs(self._y_of(price) - y) <= threshold:
+                    return ("fib", i)
+
+        for i, b in enumerate(self.rr_boxes):
+            x_l = min(self._x_of(b["i1"], self.view_start, candle_w), self._x_of(b["i2"], self.view_start, candle_w))
+            x_r = max(self._x_of(b["i1"], self.view_start, candle_w), self._x_of(b["i2"], self.view_start, candle_w))
+            if not (x_l - threshold <= x <= x_r + threshold):
+                continue
+            y_top = min(self._y_of(b["sl"]), self._y_of(b["tp"]))
+            y_bot = max(self._y_of(b["sl"]), self._y_of(b["tp"]))
+            if y_top - threshold <= y <= y_bot + threshold:
+                return ("rr_box", i)
+
         return None
 
-    _KIND_LISTS = {"hline": "h_lines", "trend": "trendlines", "rect": "rects", "rr_box": "rr_boxes"}
-    _KIND_LABELS = {"hline": "línea horizontal", "trend": "línea de tendencia", "rect": "rectángulo", "rr_box": "caja R:R"}
+    _KIND_LISTS = {"hline": "h_lines", "trend": "trendlines", "rect": "rects", "rr_box": "rr_boxes", "fib": "fibs"}
+    _KIND_LABELS = {
+        "hline": "línea horizontal", "trend": "línea de tendencia", "rect": "rectángulo",
+        "rr_box": "caja R:R", "fib": "Fibonacci",
+    }
+    _COLORABLE_KINDS = {"hline", "trend", "rect"}
+
+    def _delete_drawing(self, kind, idx):
+        del getattr(self, self._KIND_LISTS[kind])[idx]
+        self.update()
 
     def contextMenuEvent(self, event):
         pos = event.pos()
@@ -1081,19 +1109,21 @@ class ChartWidget(QWidget):
         menu = QMenu(self)
         menu.addAction(f"Editar {self._KIND_LABELS[kind]}").setEnabled(False)
         menu.addSeparator()
-        color_action = menu.addAction("🎨 Cambiar color…")
-        width_menu = menu.addMenu("Grosor")
+        color_action = None
         width_actions = {}
-        for wpx in (1, 2, 3, 4, 6):
-            a = width_menu.addAction(f"{wpx}px")
-            width_actions[a] = wpx
-        menu.addSeparator()
+        if kind in self._COLORABLE_KINDS:
+            color_action = menu.addAction("🎨 Cambiar color…")
+            width_menu = menu.addMenu("Grosor")
+            for wpx in (1, 2, 3, 4, 6):
+                a = width_menu.addAction(f"{wpx}px")
+                width_actions[a] = wpx
+            menu.addSeparator()
         delete_action = menu.addAction("🗑 Eliminar")
 
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
-        if chosen == color_action:
+        if color_action is not None and chosen == color_action:
             current = QColor(obj.get("color", "#c9a227"))
             color = QColorDialog.getColor(current, self, "Elegir color")
             if color.isValid():
@@ -1105,6 +1135,14 @@ class ChartWidget(QWidget):
         elif chosen == delete_action:
             del obj_list[idx]
             self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Backspace, Qt.Key_Delete) and self.crosshair is not None:
+            hit = self._find_drawing_at(self.crosshair)
+            if hit:
+                self._delete_drawing(*hit)
+                return
+        super().keyPressEvent(event)
 
     # ---------- guardar/restaurar dibujos al cambiar de timeframe ----------
     def export_drawings(self):
