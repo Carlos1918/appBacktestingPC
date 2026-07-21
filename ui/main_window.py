@@ -224,9 +224,12 @@ class MainWindow(QMainWindow):
         self.ema2_spin = QSpinBox(); self.ema2_spin.setRange(2, 400); self.ema2_spin.setValue(50)
         self.ema2_spin.setFixedWidth(50)
         self.ema2_spin.valueChanged.connect(self.on_ema_change)
+        self.chart_style_chk = QCheckBox("Ver en líneas")
+        self.chart_style_chk.setToolTip("Alterna entre velas japonesas y una línea de precio de cierre.")
+        self.chart_style_chk.stateChanged.connect(self.on_chart_style_change)
         for w in [self.btn_cursor, self.btn_line, self.btn_trend, self.btn_rect, self.btn_fib,
                   self.btn_rr_long, self.btn_rr_short, self.rr_ratio_spin, self.btn_clear,
-                  self.ema1_chk, self.ema1_spin, self.ema2_chk, self.ema2_spin]:
+                  self.ema1_chk, self.ema1_spin, self.ema2_chk, self.ema2_spin, self.chart_style_chk]:
             draw_row.addWidget(w)
         draw_row.addStretch()
         top_col.addLayout(draw_row)
@@ -808,6 +811,10 @@ class MainWindow(QMainWindow):
         self.chart.ema2_period = self.ema2_spin.value()
         self.chart.update()
 
+    def on_chart_style_change(self):
+        self.chart.chart_style = "line" if self.chart_style_chk.isChecked() else "candles"
+        self.chart.update()
+
     def on_ict_change(self):
         self.chart.ict_show_fvg = self.ict_fvg_chk.isChecked()
         self.chart.ict_show_ob = self.ict_ob_chk.isChecked()
@@ -1120,6 +1127,7 @@ class MainWindow(QMainWindow):
             "ema_period": ch.ema_period,
             "ema2_on": ch.ema2_on,
             "ema2_period": ch.ema2_period,
+            "chart_style": ch.chart_style,
             "tool": ch.tool,
             "rr_ratio": ch.rr_ratio,
             "price_digits": ch.price_digits,
@@ -1146,6 +1154,7 @@ class MainWindow(QMainWindow):
         ch.ema_period = state.get("ema_period", 20)
         ch.ema2_on = state.get("ema2_on", False)
         ch.ema2_period = state.get("ema2_period", 50)
+        ch.chart_style = state.get("chart_style", "candles")
         ch.rr_ratio = state.get("rr_ratio", 2.0)
         digits = state.get("price_digits")
         ch.price_digits = digits if digits is not None else ch.price_digits
@@ -1162,6 +1171,7 @@ class MainWindow(QMainWindow):
         self.ema1_spin.setValue(ch.ema_period)
         self.ema2_chk.setChecked(ch.ema2_on)
         self.ema2_spin.setValue(ch.ema2_period)
+        self.chart_style_chk.setChecked(ch.chart_style == "line")
         self.rr_ratio_spin.setValue(ch.rr_ratio)
         self.lot_spin.setValue(state.get("lot_value", 0.10))
         self.balance_spin.setValue(state.get("balance_spin_value", 10000.0))

@@ -54,6 +54,7 @@ class ChartWidget(QWidget):
         self.ema_period = 20
         self.ema2_on = False
         self.ema2_period = 50
+        self.chart_style = "candles"  # "candles" | "line"
         # Caché incremental de EMA: evita recalcular todo el histórico revelado en
         # cada repintado (ver auditoría técnica, sección de rendimiento). Se limpia
         # por completo en set_candles(); se actualiza de forma incremental cuando
@@ -466,18 +467,28 @@ class ChartWidget(QWidget):
             p.drawText(int(w - PAD_R + 6), int(y + 3), self._fmt_price(v))
             p.setPen(pen_grid)
 
-        # candles
-        for i, c in enumerate(visible):
-            idx = self.view_start + i
-            x = self._x_of(idx, self.view_start, candle_w)
-            up = c["c"] >= c["o"]
-            color = COL_UP if up else COL_DOWN
-            p.setPen(QPen(color, 1))
-            p.drawLine(int(x), int(self._y_of(c["h"])), int(x), int(self._y_of(c["l"])))
-            body_top = self._y_of(max(c["o"], c["c"]))
-            body_bot = self._y_of(min(c["o"], c["c"]))
-            bw = max(candle_w * 0.62, 1)
-            p.fillRect(int(x - bw / 2), int(body_top), int(bw), max(int(body_bot - body_top), 1), color)
+        # candles / línea de precio de cierre
+        if self.chart_style == "line":
+            pts = []
+            for i, c in enumerate(visible):
+                idx = self.view_start + i
+                x = self._x_of(idx, self.view_start, candle_w)
+                pts.append(QPointF(x, self._y_of(c["c"])))
+            p.setPen(QPen(COL_BLUE, 2))
+            for j in range(1, len(pts)):
+                p.drawLine(pts[j - 1], pts[j])
+        else:
+            for i, c in enumerate(visible):
+                idx = self.view_start + i
+                x = self._x_of(idx, self.view_start, candle_w)
+                up = c["c"] >= c["o"]
+                color = COL_UP if up else COL_DOWN
+                p.setPen(QPen(color, 1))
+                p.drawLine(int(x), int(self._y_of(c["h"])), int(x), int(self._y_of(c["l"])))
+                body_top = self._y_of(max(c["o"], c["c"]))
+                body_bot = self._y_of(min(c["o"], c["c"]))
+                bw = max(candle_w * 0.62, 1)
+                p.fillRect(int(x - bw / 2), int(body_top), int(bw), max(int(body_bot - body_top), 1), color)
 
         # EMAs
         def draw_ema(period, color):
@@ -679,6 +690,27 @@ class ChartWidget(QWidget):
                 return {"kind": "rect", "idx": i, "handle": "bottom"}
             if x_l <= x <= x_r and y_t <= y <= y_b:
                 return {"kind": "rect", "idx": i, "handle": "move"}
+
+        for i, b in enumerate(self.rr_boxes):
+            x_l = min(self._x_of(b["i1"], self.view_start, candle_w), self._x_of(b["i2"], self.view_start, candle_w))
+            x_r = max(self._x_of(b["i1"], self.view_start, candle_w), self._x_of(b["i2"], self.view_start, candle_w))
+            y_entry, y_sl, y_tp = self._y_of(b["entry"]), self._y_of(b["sl"]), self._y_of(b["tp"])
+            y_top = min(y_sl, y_tp)
+            y_bot = max(y_sl, y_tp)
+            if not (x_l - threshold <= x <= x_r + threshold):
+                continue
+            if abs(y - y_entry) <= threshold:
+                return {"kind": "rr_box", "idx": i, "handle": "entry"}
+            if abs(y - y_sl) <= threshold:
+                return {"kind": "rr_box", "idx": i, "handle": "sl"}
+            if abs(y - y_tp) <= threshold:
+                return {"kind": "rr_box", "idx": i, "handle": "tp"}
+            if abs(x - x_l) <= threshold and y_top - threshold <= y <= y_bot + threshold:
+                return {"kind": "rr_box", "idx": i, "handle": "left"}
+            if abs(x - x_r) <= threshold and y_top - threshold <= y <= y_bot + threshold:
+                return {"kind": "rr_box", "idx": i, "handle": "right"}
+            if x_l <= x <= x_r and y_top <= y <= y_bot:
+                return {"kind": "rr_box", "idx": i, "handle": "move"}
         return None
 
     def _apply_drag(self, pos):
@@ -719,6 +751,35 @@ class ChartWidget(QWidget):
                 dy_price = new_price - self._price_from_y(d["start_pos"].y())
                 obj["i1"], obj["i2"] = orig["i1"] + dx_idx, orig["i2"] + dx_idx
                 obj["p1"], obj["p2"] = orig["p1"] + dy_price, orig["p2"] + dy_price
+        elif kind == "rr_box":
+            left_key = "i1" if orig["i1"] <= orig["i2"] else "i2"
+            right_key = "i2" if left_key == "i1" else "i1"
+            if handle == "entry":
+                delta = new_price - orig["entry"]
+                obj["entry"] = new_price
+                obj["sl"] = orig["sl"] + delta
+                obj["tp"] = orig["tp"] + delta
+            elif handle == "sl":
+                obj["sl"] = new_price
+                risk = abs(obj["entry"] - obj["sl"]) or 1e-9
+                reward = abs(obj["tp"] - obj["entry"])
+                obj["ratio"] = reward / risk
+            elif handle == "tp":
+                obj["tp"] = new_price
+                risk = abs(obj["entry"] - obj["sl"]) or 1e-9
+                reward = abs(obj["tp"] - obj["entry"])
+                obj["ratio"] = reward / risk
+            elif handle == "left":
+                obj[left_key] = new_idx
+            elif handle == "right":
+                obj[right_key] = new_idx
+            elif handle == "move":
+                dx_idx = new_idx - self._idx_from_x(d["start_pos"].x(), self.view_start, candle_w)
+                dy_price = new_price - self._price_from_y(d["start_pos"].y())
+                obj["i1"], obj["i2"] = orig["i1"] + dx_idx, orig["i2"] + dx_idx
+                obj["entry"] = orig["entry"] + dy_price
+                obj["sl"] = orig["sl"] + dy_price
+                obj["tp"] = orig["tp"] + dy_price
         self.update()
 
     def _line_hit_test(self, y):
@@ -783,6 +844,7 @@ class ChartWidget(QWidget):
                     "move": Qt.SizeAllCursor, "left": Qt.SizeHorCursor, "right": Qt.SizeHorCursor,
                     "top": Qt.SizeVerCursor, "bottom": Qt.SizeVerCursor,
                     "p1": Qt.SizeAllCursor, "p2": Qt.SizeAllCursor,
+                    "entry": Qt.SizeVerCursor, "sl": Qt.SizeVerCursor, "tp": Qt.SizeVerCursor,
                 }
                 self.setCursor(cursor_map.get(handle["handle"], Qt.ArrowCursor) if handle else Qt.ArrowCursor)
 
@@ -1004,8 +1066,8 @@ class ChartWidget(QWidget):
 
         return None
 
-    _KIND_LISTS = {"hline": "h_lines", "trend": "trendlines", "rect": "rects"}
-    _KIND_LABELS = {"hline": "línea horizontal", "trend": "línea de tendencia", "rect": "rectángulo"}
+    _KIND_LISTS = {"hline": "h_lines", "trend": "trendlines", "rect": "rects", "rr_box": "rr_boxes"}
+    _KIND_LABELS = {"hline": "línea horizontal", "trend": "línea de tendencia", "rect": "rectángulo", "rr_box": "caja R:R"}
 
     def contextMenuEvent(self, event):
         pos = event.pos()
