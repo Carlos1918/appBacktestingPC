@@ -55,6 +55,16 @@ class ChartWidget(QWidget):
         self.ema2_on = False
         self.ema2_period = 50
         self.chart_style = "candles"  # "candles" | "line"
+
+        # Tema de colores personalizable (fondo, velas y color por defecto de
+        # los dibujos nuevos). Los dibujos ya existentes conservan su propio
+        # color; esto solo cambia el color con el que se crean los nuevos.
+        self.col_bg = QColor(COL_BG)
+        self.col_up = QColor(COL_UP)
+        self.col_down = QColor(COL_DOWN)
+        self.default_hline_color = "#9598a1"
+        self.default_trend_color = "#e0a800"
+        self.default_rect_color = "#c9a227"
         # Caché incremental de EMA: evita recalcular todo el histórico revelado en
         # cada repintado (ver auditoría técnica, sección de rendimiento). Se limpia
         # por completo en set_candles(); se actualiza de forma incremental cuando
@@ -242,6 +252,26 @@ class ChartWidget(QWidget):
             self.killzone_label.move(self.width() - self.killzone_label.width() - 4, self.countdown_label.y() - 22 if self.countdown_label.isVisible() else PAD_T + 4)
         super().resizeEvent(event)
 
+    # ---------- tema de colores ----------
+    def get_theme(self):
+        return {
+            "bg": self.col_bg.name(),
+            "up": self.col_up.name(),
+            "down": self.col_down.name(),
+            "hline": self.default_hline_color,
+            "trend": self.default_trend_color,
+            "rect": self.default_rect_color,
+        }
+
+    def apply_theme(self, theme):
+        self.col_bg = QColor(theme.get("bg", COL_BG.name()))
+        self.col_up = QColor(theme.get("up", COL_UP.name()))
+        self.col_down = QColor(theme.get("down", COL_DOWN.name()))
+        self.default_hline_color = theme.get("hline", "#9598a1")
+        self.default_trend_color = theme.get("trend", "#e0a800")
+        self.default_rect_color = theme.get("rect", "#c9a227")
+        self.update()
+
     # ---------- data ----------
     def set_candles(self, candles):
         self.base_candles = candles
@@ -412,7 +442,7 @@ class ChartWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, False)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, COL_BG)
+        p.fillRect(0, 0, w, h, self.col_bg)
 
         candles = self.display_candles()
         if not candles:
@@ -482,7 +512,7 @@ class ChartWidget(QWidget):
                 idx = self.view_start + i
                 x = self._x_of(idx, self.view_start, candle_w)
                 up = c["c"] >= c["o"]
-                color = COL_UP if up else COL_DOWN
+                color = self.col_up if up else self.col_down
                 p.setPen(QPen(color, 1))
                 p.drawLine(int(x), int(self._y_of(c["h"])), int(x), int(self._y_of(c["l"])))
                 body_top = self._y_of(max(c["o"], c["c"]))
@@ -904,7 +934,7 @@ class ChartWidget(QWidget):
             self.update()
             return
         if self.tool == "line":
-            self.h_lines.append({"price": self._price_from_y(pos.y()), "color": "#9598a1", "width": 1})
+            self.h_lines.append({"price": self._price_from_y(pos.y()), "color": self.default_hline_color, "width": 1})
             self._finish_two_click_tool()
             self.update()
             return
@@ -932,7 +962,7 @@ class ChartWidget(QWidget):
                 i2 = self._idx_from_x(pos.x(), self.view_start, candle_w)
                 p1 = self._price_from_y(self.drag_start.y())
                 p2 = self._price_from_y(pos.y())
-                self.trendlines.append({"i1": i1, "p1": p1, "i2": i2, "p2": p2, "color": "#e0a800", "width": 2})
+                self.trendlines.append({"i1": i1, "p1": p1, "i2": i2, "p2": p2, "color": self.default_trend_color, "width": 2})
                 self.drag_start = None
                 self.drag_current = None
                 self._finish_two_click_tool()
@@ -947,7 +977,7 @@ class ChartWidget(QWidget):
                 i2 = self._idx_from_x(pos.x(), self.view_start, candle_w)
                 p1 = self._price_from_y(self.drag_start.y())
                 p2 = self._price_from_y(pos.y())
-                self.rects.append({"i1": i1, "p1": p1, "i2": i2, "p2": p2, "color": "#c9a227", "width": 1})
+                self.rects.append({"i1": i1, "p1": p1, "i2": i2, "p2": p2, "color": self.default_rect_color, "width": 1})
                 self.drag_start = None
                 self.drag_current = None
                 self._finish_two_click_tool()

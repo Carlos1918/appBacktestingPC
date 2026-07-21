@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QLabel, QFileDialog, QLineEdit, QComboBox, QSlider, QCheckBox, QSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QCompleter,
     QDockWidget, QSizePolicy, QMessageBox, QDoubleSpinBox,
-    QListWidget, QDialog, QDialogButtonBox, QInputDialog
+    QListWidget, QDialog, QDialogButtonBox, QInputDialog, QColorDialog
 )
 from PySide6.QtCore import Qt, QTimer, QSettings, Signal
 from PySide6.QtGui import QColor, QAction
@@ -227,9 +227,13 @@ class MainWindow(QMainWindow):
         self.chart_style_chk = QCheckBox("Ver en líneas")
         self.chart_style_chk.setToolTip("Alterna entre velas japonesas y una línea de precio de cierre.")
         self.chart_style_chk.stateChanged.connect(self.on_chart_style_change)
+        self.btn_colors = QPushButton("🎨 Colores")
+        self.btn_colors.setToolTip("Personalizar el color del fondo, las velas y los dibujos nuevos.")
+        self.btn_colors.clicked.connect(self.on_edit_colors)
         for w in [self.btn_cursor, self.btn_line, self.btn_trend, self.btn_rect, self.btn_fib,
                   self.btn_rr_long, self.btn_rr_short, self.rr_ratio_spin, self.btn_clear,
-                  self.ema1_chk, self.ema1_spin, self.ema2_chk, self.ema2_spin, self.chart_style_chk]:
+                  self.ema1_chk, self.ema1_spin, self.ema2_chk, self.ema2_spin, self.chart_style_chk,
+                  self.btn_colors]:
             draw_row.addWidget(w)
         draw_row.addStretch()
         top_col.addLayout(draw_row)
@@ -347,6 +351,7 @@ class MainWindow(QMainWindow):
         restore_action.triggered.connect(lambda: self.restore_default_layout(dock_top, dock_journal))
 
         self.settings = QSettings("TraderMindMC", "BacktestICT")
+        self._load_theme_from_settings()
         # Si el diseño guardado es de una versión anterior de la app (con otra
         # disposición de paneles), lo ignoramos y aplicamos el nuevo por defecto
         # en vez de heredar una posición que ya no tiene sentido.
@@ -814,6 +819,77 @@ class MainWindow(QMainWindow):
     def on_chart_style_change(self):
         self.chart.chart_style = "line" if self.chart_style_chk.isChecked() else "candles"
         self.chart.update()
+
+    def _save_theme_to_settings(self, theme):
+        for key, value in theme.items():
+            self.settings.setValue(f"chart_theme/{key}", value)
+
+    def _load_theme_from_settings(self):
+        theme = self.chart.get_theme()
+        for key in theme:
+            val = self.settings.value(f"chart_theme/{key}")
+            if val:
+                theme[key] = val
+        self.chart.apply_theme(theme)
+
+    def on_edit_colors(self):
+        theme = dict(self.chart.get_theme())
+        default_theme = {"bg": "#1e222d", "up": "#26a69a", "down": "#ef5350",
+                          "hline": "#9598a1", "trend": "#e0a800", "rect": "#c9a227"}
+        fields = [
+            ("bg", "Fondo del gráfico"),
+            ("up", "Velas alcistas"),
+            ("down", "Velas bajistas"),
+            ("hline", "Línea horizontal (nuevas)"),
+            ("trend", "Línea de tendencia (nuevas)"),
+            ("rect", "Rectángulo (nuevas)"),
+        ]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Personalizar colores")
+        layout = QVBoxLayout(dialog)
+        grid = QGridLayout()
+        layout.addLayout(grid)
+        swatches = {}
+
+        def swatch_style(hexcolor):
+            return f"background-color: {hexcolor}; border: 1px solid #555;"
+
+        def make_pick_handler(key, btn):
+            def pick():
+                color = QColorDialog.getColor(QColor(theme[key]), dialog, "Elegir color")
+                if color.isValid():
+                    theme[key] = color.name()
+                    btn.setStyleSheet(swatch_style(theme[key]))
+                    self.chart.apply_theme(theme)
+                    self._save_theme_to_settings(theme)
+            return pick
+
+        for row, (key, label) in enumerate(fields):
+            grid.addWidget(QLabel(label), row, 0)
+            btn = QPushButton()
+            btn.setFixedSize(60, 24)
+            btn.setStyleSheet(swatch_style(theme[key]))
+            btn.clicked.connect(make_pick_handler(key, btn))
+            swatches[key] = btn
+            grid.addWidget(btn, row, 1)
+
+        def on_reset():
+            theme.update(default_theme)
+            for key, btn in swatches.items():
+                btn.setStyleSheet(swatch_style(theme[key]))
+            self.chart.apply_theme(theme)
+            self._save_theme_to_settings(theme)
+
+        reset_btn = QPushButton("Restaurar valores por defecto")
+        reset_btn.clicked.connect(on_reset)
+        layout.addWidget(reset_btn)
+
+        close_btn = QPushButton("Cerrar")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
 
     def on_ict_change(self):
         self.chart.ict_show_fvg = self.ict_fvg_chk.isChecked()
