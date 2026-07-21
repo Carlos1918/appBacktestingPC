@@ -583,24 +583,7 @@ class ChartWidget(QWidget):
 
         # cajas de riesgo/beneficio (long y short)
         for box in self.rr_boxes:
-            x_l = min(self._x_of(box["i1"], self.view_start, candle_w), self._x_of(box["i2"], self.view_start, candle_w))
-            x_r = max(self._x_of(box["i1"], self.view_start, candle_w), self._x_of(box["i2"], self.view_start, candle_w))
-            entry, sl, tp = box["entry"], box["sl"], box["tp"]
-            y_entry, y_sl, y_tp = self._y_of(entry), self._y_of(sl), self._y_of(tp)
-            green = QColor("#26a69a"); green.setAlpha(45)
-            red = QColor("#ef5350"); red.setAlpha(45)
-            top_profit, bot_profit = (y_tp, y_entry) if y_tp < y_entry else (y_entry, y_tp)
-            top_loss, bot_loss = (y_entry, y_sl) if y_entry < y_sl else (y_sl, y_entry)
-            p.fillRect(int(x_l), int(top_profit), int(x_r - x_l), int(bot_profit - top_profit), green)
-            p.fillRect(int(x_l), int(top_loss), int(x_r - x_l), int(bot_loss - top_loss), red)
-            pen = QPen(QColor("#c9a227"), 1, Qt.DashLine)
-            p.setPen(pen)
-            p.drawLine(int(x_l), int(y_entry), int(x_r), int(y_entry))
-            p.setPen(QColor("#d1d4dc"))
-            risk = abs(entry - sl)
-            reward = abs(tp - entry)
-            rr_txt = f"{box['kind'].upper()}  Riesgo: {self._fmt_price(risk)}  Beneficio: {self._fmt_price(reward)}  R:R 1:{box['ratio']:.1f}"
-            p.drawText(int(x_l) + 4, int(top_profit) - 4 if box["kind"] == "long" else int(bot_loss) + 14, rr_txt)
+            self._draw_rr_box(p, box, candle_w)
 
         # fibonacci
         for f in self.fibs:
@@ -631,9 +614,15 @@ class ChartWidget(QWidget):
         # drag preview
         TWO_CLICK_TOOLS = ("fib", "trend", "rect", "rr_long", "rr_short")
         if self.drag_start and self.drag_current and self.tool in TWO_CLICK_TOOLS:
-            pen = QPen(COL_GOLD, 1, Qt.DashLine)
-            p.setPen(pen)
-            p.drawLine(self.drag_start, self.drag_current)
+            if self.tool in ("rr_long", "rr_short"):
+                preview = self._rr_box_from_clicks(
+                    "long" if self.tool == "rr_long" else "short", self.drag_start, self.drag_current, candle_w,
+                )
+                self._draw_rr_box(p, preview, candle_w)
+            else:
+                pen = QPen(COL_GOLD, 1, Qt.DashLine)
+                p.setPen(pen)
+                p.drawLine(self.drag_start, self.drag_current)
 
         # crosshair
         if self.crosshair:
@@ -970,21 +959,7 @@ class ChartWidget(QWidget):
                 self.drag_start = pos
             else:
                 kind = "long" if self.tool == "rr_long" else "short"
-                i1 = self._idx_from_x(self.drag_start.x(), self.view_start, candle_w)
-                i2 = self._idx_from_x(pos.x(), self.view_start, candle_w)
-                entry = self._price_from_y(self.drag_start.y())
-                stop_click = self._price_from_y(pos.y())
-                risk = abs(entry - stop_click) or (entry * 0.003)
-                if kind == "long":
-                    sl = entry - risk
-                    tp = entry + risk * self.rr_ratio
-                else:
-                    sl = entry + risk
-                    tp = entry - risk * self.rr_ratio
-                self.rr_boxes.append({
-                    "kind": kind, "i1": i1, "i2": i2, "entry": entry, "sl": sl, "tp": tp,
-                    "ratio": self.rr_ratio,
-                })
+                self.rr_boxes.append(self._rr_box_from_clicks(kind, self.drag_start, pos, candle_w))
                 self.drag_start = None
                 self.drag_current = None
                 self._finish_two_click_tool()
@@ -1273,6 +1248,45 @@ class ChartWidget(QWidget):
         except Exception as e:
             self._ict_cache = {"_key": key}
         return self._ict_cache
+
+    def _rr_box_from_clicks(self, kind, click1, click2, candle_w):
+        """Arma un dict de caja R:R igual al que se guarda en self.rr_boxes, a
+        partir de los dos puntos de clic. Se usa tanto al crear la caja como
+        para dibujar el preview en vivo mientras se arrastra (con el ratio
+        actual, por defecto 1:2), así el usuario ve desde el primer momento
+        la misma caja editable que va a quedar puesta."""
+        i1 = self._idx_from_x(click1.x(), self.view_start, candle_w)
+        i2 = self._idx_from_x(click2.x(), self.view_start, candle_w)
+        entry = self._price_from_y(click1.y())
+        stop_click = self._price_from_y(click2.y())
+        risk = abs(entry - stop_click) or (entry * 0.003)
+        if kind == "long":
+            sl = entry - risk
+            tp = entry + risk * self.rr_ratio
+        else:
+            sl = entry + risk
+            tp = entry - risk * self.rr_ratio
+        return {"kind": kind, "i1": i1, "i2": i2, "entry": entry, "sl": sl, "tp": tp, "ratio": self.rr_ratio}
+
+    def _draw_rr_box(self, p, box, candle_w):
+        x_l = min(self._x_of(box["i1"], self.view_start, candle_w), self._x_of(box["i2"], self.view_start, candle_w))
+        x_r = max(self._x_of(box["i1"], self.view_start, candle_w), self._x_of(box["i2"], self.view_start, candle_w))
+        entry, sl, tp = box["entry"], box["sl"], box["tp"]
+        y_entry, y_sl, y_tp = self._y_of(entry), self._y_of(sl), self._y_of(tp)
+        green = QColor("#26a69a"); green.setAlpha(45)
+        red = QColor("#ef5350"); red.setAlpha(45)
+        top_profit, bot_profit = (y_tp, y_entry) if y_tp < y_entry else (y_entry, y_tp)
+        top_loss, bot_loss = (y_entry, y_sl) if y_entry < y_sl else (y_sl, y_entry)
+        p.fillRect(int(x_l), int(top_profit), int(x_r - x_l), int(bot_profit - top_profit), green)
+        p.fillRect(int(x_l), int(top_loss), int(x_r - x_l), int(bot_loss - top_loss), red)
+        pen = QPen(QColor("#c9a227"), 1, Qt.DashLine)
+        p.setPen(pen)
+        p.drawLine(int(x_l), int(y_entry), int(x_r), int(y_entry))
+        p.setPen(QColor("#d1d4dc"))
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rr_txt = f"{box['kind'].upper()}  Riesgo: {self._fmt_price(risk)}  Beneficio: {self._fmt_price(reward)}  R:R 1:{box['ratio']:.1f}"
+        p.drawText(int(x_l) + 4, int(top_profit) - 4 if box["kind"] == "long" else int(bot_loss) + 14, rr_txt)
 
     def _draw_fvgs(self, p, fvgs):
         for fvg in fvgs:
